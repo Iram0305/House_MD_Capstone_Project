@@ -9,16 +9,13 @@ from src.research import run_research_node
 from src.cmo import run_cmo_node
 from src.router import evaluate_convergence_edge
 
-# Browser tab presentation configurations
 st.set_page_config(page_title="House M.D. Swarm", layout="wide")
 st.title("🩺 The 'House M.D.' Swarm: Rare Disease Explorer")
 st.caption("An Autonomous Stateful Multi-Agent Deliberation Panel for Complex Clinical Diagnostics")
 
 def build_workflow_graph():
-    # Initialize the architecture state tracker graph
     workflow = StateGraph(MedicalBoardState)
     
-    # Register graph computational nodes
     workflow.add_node("parser", run_parser_node)
     workflow.add_node("neurologist", neurologist_node)
     workflow.add_node("immunologist", immunologist_node)
@@ -27,14 +24,12 @@ def build_workflow_graph():
     workflow.add_node("research", run_research_node)
     workflow.add_node("cmo", run_cmo_node)
     
-    # Draw linear structural execution paths
     workflow.set_entry_point("parser")
     workflow.add_edge("parser", "neurologist")
     workflow.add_edge("neurologist", "immunologist")
     workflow.add_edge("immunologist", "geneticist")
     workflow.add_edge("geneticist", "scribe")
     
-    # Establish looping criteria links using your router file configurations
     workflow.add_conditional_edges(
         "scribe",
         evaluate_convergence_edge,
@@ -49,11 +44,9 @@ def build_workflow_graph():
     
     return workflow.compile()
 
-# Build the document file ingestion card
 uploaded_file = st.file_uploader("Upload Patient Case Report (PDF Format)", type=["pdf"])
 
 if uploaded_file is not None:
-    # Run a fast localized page text reader layout sequence
     pdf_reader = PdfReader(uploaded_file)
     extracted_text = ""
     for page in pdf_reader.pages:
@@ -62,36 +55,31 @@ if uploaded_file is not None:
     st.success("Case file text extracted successfully!")
     
     if st.button("Trigger Autonomous Diagnostics Board"):
-        # Setup initial clipboard dictionary variables
         initial_state: MedicalBoardState = {
             "raw_narrative": extracted_text,
             "validated_hpo_codes": [],
             "hpo_labels": {},
             "current_guesses": [],
             "raw_debate_history": [],
-            "full_debate_log": [],  # Initialized empty for transcript logging
+            "full_debate_log": [],  
             "compressed_transcript": "No notes yet. Debate has initialized.",
             "evidence_payload": {},
             "final_report": {},
             "debate_turn_counter": 0
         }
         
-        # Compile and invoke the system brain loop execution framework
         app_graph = build_workflow_graph()
         
-        with st.spinner("Medical board convening... analyzing data vectors via Groq..."):
+        with st.spinner("Medical board convening... analyzing data vectors via Gemini..."):
             final_output = app_graph.invoke(initial_state)
             
         st.balloons()
         st.markdown("---")
         
-        # Split layout presentation cards
         left_col, right_col = st.columns(2)
         
         with left_col:
             st.subheader("💬 Live Medical Boardroom Transcript")
-            
-            # Loop through permanent records and output with custom avatars
             for line in final_output.get("full_debate_log", []):
                 if "[Neurology Doctor]" in line:
                     clean_text = line.replace("[Neurology Doctor]: ", "")
