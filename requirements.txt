@@ -1,4 +1,4 @@
-groq
+google-genai
 langgraph
 streamlit
 pypdf
