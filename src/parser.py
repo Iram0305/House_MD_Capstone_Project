@@ -1,12 +1,34 @@
 import json
 import os
+import time
+import groq
 from groq import Groq
 from src.state import MedicalBoardState
 
+def call_groq_with_backoff(client, model, messages, temperature=0):
+    """Safely executes a Groq API call with an exponential backoff sleep loop."""
+    delay = 4  # Starting delay in seconds
+    max_retries = 5
+    
+    for attempt in range(max_retries):
+        try:
+            # Enforce a brief baseline cooling period between back-to-back nodes
+            time.sleep(1)
+            completion = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature
+            )
+            return completion
+        except groq.RateLimitError as e:
+            if attempt == max_retries - 1:
+                raise e  # Propagate the error if we ran out of attempts
+            print(f"⚠️ [Parser Rate Limit Hit]: Retrying execution vector in {delay}s...")
+            time.sleep(delay)
+            delay *= 2  # Double the backoff duration
+
 def run_parser_node(state: MedicalBoardState) -> dict:
     print("\n--- PHASE 1: LIGHTWEIGHT GROQ PARSER ---")
-    
-    # Connects to Groq using the cloud key
     client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
     
     prompt = f"""
@@ -17,7 +39,9 @@ def run_parser_node(state: MedicalBoardState) -> dict:
     Patient Story: {state['raw_narrative']}
     """
     
-    completion = client.chat.completions.create(
+    # Execute through our protected backoff channel
+    completion = call_groq_with_backoff(
+        client=client,
         model="llama-3.1-8b-instant",
         messages=[{"role": "user", "content": prompt}],
         temperature=0
@@ -29,7 +53,6 @@ def run_parser_node(state: MedicalBoardState) -> dict:
     validated_codes = []
     labels_map = {}
     
-    # Read the text file directly into background memory safely
     if os.path.exists("data/hp-base.json"):
         with open("data/hp-base.json", "r") as f:
             hpo_data = json.load(f)
