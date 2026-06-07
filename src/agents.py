@@ -1,12 +1,32 @@
 import os
+import time
+import groq
 from groq import Groq
 from src.state import MedicalBoardState
 
-def run_specialist_debate(state: MedicalBoardState, specialty_name: str, specialty_focus: str) -> dict:
-    # Authenticate safely using your remote cloud dashboard keys
-    client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+def call_groq_with_backoff(client, model, messages, temperature=0.7):
+    """Safely executes a Groq API call with an exponential backoff sleep loop."""
+    delay = 4  
+    max_retries = 5
     
-    # Format the validated HPO symptom codes cleanly for the Llama context window
+    for attempt in range(max_retries):
+        try:
+            time.sleep(1)
+            completion = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature
+            )
+            return completion
+        except groq.RateLimitError as e:
+            if attempt == max_retries - 1:
+                raise e
+            print(f"⚠️ [Specialist Rate Limit Hit]: Retrying execution vector in {delay}s...")
+            time.sleep(delay)
+            delay *= 2
+
+def run_specialist_debate(state: MedicalBoardState, specialty_name: str, specialty_focus: str) -> dict:
+    client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
     symptom_list = [f"{code} ({state['hpo_labels'][code]})" for code in state['validated_hpo_codes']]
     
     prompt = f"""
@@ -21,8 +41,9 @@ def run_specialist_debate(state: MedicalBoardState, specialty_name: str, special
     Final Guesses: [Disease A, Disease B, Disease C]
     """
     
-    # Call the high-speed Llama inference engine on Groq Cloud
-    completion = client.chat.completions.create(
+    # Execute using the fault-tolerant backoff system
+    completion = call_groq_with_backoff(
+        client=client,
         model="llama-3.3-70b-versatile",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.7
@@ -32,21 +53,18 @@ def run_specialist_debate(state: MedicalBoardState, specialty_name: str, special
     chat_line = f"[{specialty_name} Doctor]: {argument_output}"
     print(chat_line)
     
-    # Simple isolation logic to strip out candidate strings safely
     try:
         guess_str = argument_output.split("[")[-1].split("]")[0]
         guesses = [g.strip() for g in guess_str.split(",")]
     except Exception:
         guesses = ["Undetermined Rare Condition"]
 
-    # Save details to short-term list containers for processing
     updated_guesses = list(state.get("current_guesses", []))
     updated_guesses.append({"specialty": specialty_name, "candidates": guesses})
     
     updated_history = list(state.get("raw_debate_history", []))
     updated_history.append(chat_line)
     
-    # Commit a permanent copy to our UI history tracker log
     updated_full_log = list(state.get("full_debate_log", []))
     updated_full_log.append(chat_line)
     
