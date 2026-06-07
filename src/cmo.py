@@ -1,6 +1,27 @@
 import os
+import time
+import groq
 from groq import Groq
 from src.state import MedicalBoardState
+
+def call_groq_with_backoff(client, model, messages, temperature=0):
+    delay = 4  
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            time.sleep(1)
+            completion = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature
+            )
+            return completion
+        except groq.RateLimitError as e:
+            if attempt == max_retries - 1:
+                raise e
+            print(f"⚠️ [CMO Rate Limit Hit]: Retrying final synthesis in {delay}s...")
+            time.sleep(delay)
+            delay *= 2
 
 def run_cmo_node(state: MedicalBoardState) -> dict:
     print("\n--- PHASE 4: CMO SYNTHESIS REPORT ---")
@@ -18,7 +39,8 @@ def run_cmo_node(state: MedicalBoardState) -> dict:
     Format layout with structured clinical headings.
     """
     
-    completion = client.chat.completions.create(
+    completion = call_groq_with_backoff(
+        client=client,
         model="llama-3.3-70b-versatile",
         messages=[{"role": "user", "content": prompt}],
         temperature=0
