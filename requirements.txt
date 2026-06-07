@@ -1,8 +1,5 @@
-langchain-openai
+groq
 langgraph
-fastapi
 streamlit
-chromadb
-pydantic
-requests
 pypdf
+requests
