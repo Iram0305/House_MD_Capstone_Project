@@ -1,0 +1,8 @@
+langchain-openai
+langgraph
+fastapi
+streamlit
+chromadb
+pydantic
+requests
+pypdf
