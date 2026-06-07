@@ -1,37 +1,19 @@
 import os
-import time
-import groq
-from groq import Groq
+from google import genai
+from google.genai import types
 from src.state import MedicalBoardState
-
-def call_groq_with_backoff(client, model, messages, temperature=0):
-    delay = 4  
-    max_retries = 5
-    for attempt in range(max_retries):
-        try:
-            time.sleep(1)
-            completion = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=temperature
-            )
-            return completion
-        except groq.RateLimitError as e:
-            if attempt == max_retries - 1:
-                raise e
-            print(f"⚠️ [CMO Rate Limit Hit]: Retrying final synthesis in {delay}s...")
-            time.sleep(delay)
-            delay *= 2
 
 def run_cmo_node(state: MedicalBoardState) -> dict:
     print("\n--- PHASE 4: CMO SYNTHESIS REPORT ---")
-    client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+    client = genai.Client()
     
     evidence = state.get("evidence_payload", {})
     verified_context = {d: p for d, p in evidence.items() if p["orphadata_match"] or p["pubmed_citations"]}
     
-    prompt = f"""
-    Act as the Chief Medical Officer. Compile the final definitive clinical diagnostic support document.
+    system_instruction = "Act as the Chief Medical Officer."
+    
+    user_prompt = f"""
+    Compile the final definitive clinical diagnostic support document.
     Include only conditions backed by verified tokens.
     
     Verified Sources: {verified_context}
@@ -39,10 +21,12 @@ def run_cmo_node(state: MedicalBoardState) -> dict:
     Format layout with structured clinical headings.
     """
     
-    completion = call_groq_with_backoff(
-        client=client,
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0
+    response = client.models.generate_content(
+        model="gemini-3.5-flash",
+        contents=user_prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=system_instruction,
+            temperature=0
+        )
     )
-    return {"final_report": {"free_text_report": completion.choices[0].message.content}}
+    return {"final_report": {"free_text_report": response.text}}
