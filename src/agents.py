@@ -1,36 +1,15 @@
 import os
-import time
-import groq
-from groq import Groq
+from google import genai
+from google.genai import types
 from src.state import MedicalBoardState
 
-def call_groq_with_backoff(client, model, messages, temperature=0.7):
-    """Safely executes a Groq API call with an exponential backoff sleep loop."""
-    delay = 4  
-    max_retries = 5
-    
-    for attempt in range(max_retries):
-        try:
-            time.sleep(1)
-            completion = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=temperature
-            )
-            return completion
-        except groq.RateLimitError as e:
-            if attempt == max_retries - 1:
-                raise e
-            print(f"⚠️ [Specialist Rate Limit Hit]: Retrying execution vector in {delay}s...")
-            time.sleep(delay)
-            delay *= 2
-
 def run_specialist_debate(state: MedicalBoardState, specialty_name: str, specialty_focus: str) -> dict:
-    client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+    client = genai.Client()
     symptom_list = [f"{code} ({state['hpo_labels'][code]})" for code in state['validated_hpo_codes']]
     
-    prompt = f"""
-    You are a world-class Medical Specialist in {specialty_name}. Core Target Focus: {specialty_focus}.
+    system_instruction = f"You are a world-class Medical Specialist in {specialty_name}. Core Target Focus: {specialty_focus}."
+    
+    user_prompt = f"""
     Review these patient symptoms: {symptom_list}
     
     Current board summary notes from previous discussions:
@@ -41,15 +20,16 @@ def run_specialist_debate(state: MedicalBoardState, specialty_name: str, special
     Final Guesses: [Disease A, Disease B, Disease C]
     """
     
-    # Execute using the fault-tolerant backoff system
-    completion = call_groq_with_backoff(
-        client=client,
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.7
+    response = client.models.generate_content(
+        model="gemini-3.5-flash",
+        contents=user_prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=system_instruction,
+            temperature=0.7
+        )
     )
     
-    argument_output = completion.choices[0].message.content
+    argument_output = response.text
     chat_line = f"[{specialty_name} Doctor]: {argument_output}"
     print(chat_line)
     
