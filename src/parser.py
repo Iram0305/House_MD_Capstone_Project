@@ -1,13 +1,33 @@
 import json
 import os
+import time
 from google import genai
 from google.genai import types
+from google.genai import errors
 from src.state import MedicalBoardState
+
+def generate_with_retry(client, model, contents, config=None):
+    """Safely handles Gemini API calls with automatic retry backoff for rate limits."""
+    delay = 4  # Start with a 4-second delay
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            # Subtle baseline pause to prevent hitting aggressive RPM limits
+            time.sleep(1)
+            return client.models.generate_content(model=model, contents=contents, config=config)
+        except errors.ClientError as e:
+            # If it's a 429 Rate Limit error, back off and try again
+            if getattr(e, 'status_code', None) == 429 or "429" in str(e):
+                if attempt == max_retries - 1:
+                    raise e
+                print(f"⚠️ [Parser Rate Limit]: Retrying in {delay} seconds...")
+                time.sleep(delay)
+                delay *= 2
+            else:
+                raise e
 
 def run_parser_node(state: MedicalBoardState) -> dict:
     print("\n--- PHASE 1: LIGHTWEIGHT GEMINI PARSER ---")
-    
-    # The client automatically picks up GEMINI_API_KEY from environment variables
     client = genai.Client()
     
     prompt = f"""
@@ -18,7 +38,8 @@ def run_parser_node(state: MedicalBoardState) -> dict:
     Patient Story: {state['raw_narrative']}
     """
     
-    response = client.models.generate_content(
+    response = generate_with_retry(
+        client=client,
         model="gemini-3.5-flash",
         contents=prompt,
         config=types.GenerateContentConfig(temperature=0)
