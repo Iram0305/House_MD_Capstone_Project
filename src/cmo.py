@@ -1,7 +1,26 @@
 import os
+import time
 from google import genai
 from google.genai import types
+from google.genai import errors
 from src.state import MedicalBoardState
+
+def generate_with_retry(client, model, contents, config=None):
+    delay = 4  
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            time.sleep(1)
+            return client.models.generate_content(model=model, contents=contents, config=config)
+        except errors.ClientError as e:
+            if getattr(e, 'status_code', None) == 429 or "429" in str(e):
+                if attempt == max_retries - 1:
+                    raise e
+                print(f"⚠️ [CMO Rate Limit]: Retrying executive synthesis in {delay} seconds...")
+                time.sleep(delay)
+                delay *= 2
+            else:
+                raise e
 
 def run_cmo_node(state: MedicalBoardState) -> dict:
     print("\n--- PHASE 4: CMO SYNTHESIS REPORT ---")
@@ -21,7 +40,8 @@ def run_cmo_node(state: MedicalBoardState) -> dict:
     Format layout with structured clinical headings.
     """
     
-    response = client.models.generate_content(
+    response = generate_with_retry(
+        client=client,
         model="gemini-3.5-flash",
         contents=user_prompt,
         config=types.GenerateContentConfig(
