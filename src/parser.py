@@ -7,24 +7,22 @@ from google.genai import errors
 from src.state import MedicalBoardState
 
 def generate_with_retry(client, model, contents, config=None):
-    """Safely handles Gemini API calls with automatic retry backoff for rate limits."""
-    delay = 4  # Start with a 4-second delay
+    """Safely handles Gemini API calls with automatic retry backoff for all API errors."""
+    delay = 4  
     max_retries = 5
     for attempt in range(max_retries):
         try:
-            # Subtle baseline pause to prevent hitting aggressive RPM limits
+            # Baseline pacing to prevent hitting rapid burst traffic filters
             time.sleep(1)
             return client.models.generate_content(model=model, contents=contents, config=config)
-        except errors.ClientError as e:
-            # If it's a 429 Rate Limit error, back off and try again
-            if getattr(e, 'status_code', None) == 429 or "429" in str(e):
-                if attempt == max_retries - 1:
-                    raise e
-                print(f"⚠️ [Parser Rate Limit]: Retrying in {delay} seconds...")
-                time.sleep(delay)
-                delay *= 2
-            else:
+        except errors.APIError as e:
+            # Catches ClientError (429) AND ServerError (500/503)
+            if attempt == max_retries - 1:
                 raise e
+            status_code = getattr(e, 'status_code', '5xx/Timeout')
+            print(f"⚠️ [Gemini API Error - Status {status_code}]: Retrying in {delay} seconds...")
+            time.sleep(delay)
+            delay *= 2
 
 def run_parser_node(state: MedicalBoardState) -> dict:
     print("\n--- PHASE 1: LIGHTWEIGHT GEMINI PARSER ---")
@@ -55,7 +53,7 @@ def run_parser_node(state: MedicalBoardState) -> dict:
         with open("data/hp-base.json", "r") as f:
             hpo_data = json.load(f)
             
-        nodes = hpo_data.get("graphs", [{}])[0].get("nodes", [])
+        nodes = hpo_data.get("graphs", [{}])[0].get("nodes", []):
         
         for phrase in extracted_phrases:
             if not phrase: continue
