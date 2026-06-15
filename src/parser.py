@@ -1,76 +1,101 @@
+"""
+src/parser.py  —  Phase 1: Lightweight Symptom Parser Node
+===========================================================
+Strips raw patient narratives via LLM and maps symptoms to validated
+Human Phenotype Ontology (HPO) codes from data/hp-base.json.
+
+All API calls route through src.api_utils.generate_with_retry so that
+pacing, retry logic, and model selection are managed in one place.
+"""
+
 import json
-import os
-import time
-from google import genai
+import re
+
 from google.genai import types
-from google.genai import errors
+
+from src.api_utils import ACTIVE_MODEL, generate_with_retry
 from src.state import MedicalBoardState
 
-def generate_with_retry(client, model, contents, config=None):
-    """Safely handles Gemini API calls with automatic retry backoff for all API errors."""
-    delay = 4  
-    max_retries = 5
-    for attempt in range(max_retries):
-        try:
-            # Baseline pacing to prevent hitting rapid burst traffic filters
-            time.sleep(1)
-            return client.models.generate_content(model=model, contents=contents, config=config)
-        except errors.APIError as e:
-            # Catches ClientError (429) AND ServerError (500/503)
-            if attempt == max_retries - 1:
-                raise e
-            status_code = getattr(e, 'status_code', '5xx/Timeout')
-            print(f"⚠️ [Gemini API Error - Status {status_code}]: Retrying in {delay} seconds...")
-            time.sleep(delay)
-            delay *= 2
 
+# ─────────────────────────────────────────────────────────────────────────────
+# HPO LOOKUP  (loaded once at import time, not on every node invocation)
+# ─────────────────────────────────────────────────────────────────────────────
+def _load_hpo_index(path: str = "data/hp-base.json") -> dict[str, str]:
+    """Return {label_lowercase: HP:XXXXXXX} mapping for containment matching."""
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
+    # Normalise: accept both {id, label} list and {label: id} dict formats
+    if isinstance(raw, list):
+        return {entry["label"].lower(): entry["id"] for entry in raw}
+    return {k.lower(): v for k, v in raw.items()}
+
+
+_HPO_INDEX: dict[str, str] = _load_hpo_index()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PARSER NODE
+# ─────────────────────────────────────────────────────────────────────────────
 def run_parser_node(state: MedicalBoardState) -> dict:
-    print("\n--- PHASE 1: LIGHTWEIGHT GEMINI PARSER ---")
-    client = genai.Client()
-    
-    prompt = f"""
-    Extract all physical symptoms or clinical terms from this patient story. 
-    Return them as a simple comma-separated string list (e.g., tremor, fatigue, weakness).
-    Do not add introductory chat filler.
-    
-    Patient Story: {state['raw_narrative']}
     """
-    
-    response = generate_with_retry(
-        client=client,
-        model="gemini-3.5-flash",
-        contents=prompt,
-        config=types.GenerateContentConfig(temperature=0)
+    LangGraph node: Phase 1 — extract symptom keywords from the raw narrative,
+    then gate them against the local HPO ontology.
+
+    Returns a partial state dict with:
+      validated_hpo_codes  : list of matched HP:XXXXXXX codes
+      hpo_labels           : {code: human-readable label}
+    """
+    prompt = f"""
+You are a clinical NLP specialist. Extract every distinct medical symptom or
+clinical sign from the patient story below. Return ONLY a JSON array of
+lowercase symptom strings and nothing else — no explanation, no markdown fences.
+
+Example output: ["muscle weakness", "seizures", "elevated creatine kinase"]
+
+Patient Story:
+{state['raw_narrative']}
+"""
+
+    config = types.GenerateContentConfig(
+        system_instruction=(
+            "You are a medical NLP extraction engine. "
+            "Respond only with a raw JSON array. No prose, no markdown."
+        ),
+        temperature=0.1,   # low temperature for deterministic extraction
     )
-    
-    extracted_phrases = [p.strip().lower() for p in response.text.split(",")]
-    print(f"Gemini Extracted Items: {extracted_phrases}")
-    
-    validated_codes = []
-    labels_map = {}
-    
-    if os.path.exists("data/hp-base.json"):
-        with open("data/hp-base.json", "r") as f:
-            hpo_data = json.load(f)
-            
-        # FIXED: Removed the trailing colon from the line below
-        nodes = hpo_data.get("graphs", [{}])[0].get("nodes", [])
-        
-        for phrase in extracted_phrases:
-            if not phrase: continue
-            for node in nodes:
-                if "id" in node and "lbl" in node and "HP_" in node["id"]:
-                    label = node["lbl"].lower()
-                    if phrase in label or label in phrase:
-                        hpo_id = node["id"].split("/")[-1].replace("_", ":")
-                        if hpo_id not in validated_codes:
-                            validated_codes.append(hpo_id)
-                            labels_map[hpo_id] = node["lbl"]
-                            break 
-                            
-    print(f"Validated HPO Codes: {validated_codes}")
+
+    # ── Single API call — uses shared pacing + retry wrapper ─────────────────
+    response = generate_with_retry(contents=prompt, config=config)
+    raw_text = response.text.strip()
+
+    # ── Parse the JSON array the model returned ───────────────────────────────
+    # Strip accidental markdown fences the model might sneak in despite instructions
+    raw_text = re.sub(r"```(?:json)?", "", raw_text).strip().rstrip("`")
+    try:
+        symptom_keywords: list[str] = json.loads(raw_text)
+    except json.JSONDecodeError:
+        # Graceful degradation: pull any quoted strings out of the response
+        symptom_keywords = re.findall(r'"([^"]+)"', raw_text)
+
+    # ── Ontological hard-gating: map to HPO codes via containment filter ──────
+    validated_codes: list[str] = []
+    hpo_labels: dict[str, str] = {}
+
+    for keyword in symptom_keywords:
+        keyword_lower = keyword.lower().strip()
+        for label, code in _HPO_INDEX.items():
+            if keyword_lower in label or label in keyword_lower:
+                if code not in validated_codes:
+                    validated_codes.append(code)
+                    hpo_labels[code] = label
+                break  # first match wins per keyword
+
+    # Fallback: avoid passing an empty payload to the debate phase
+    if not validated_codes:
+        validated_codes = ["HP:0000001"]   # HPO root "Phenotypic abnormality"
+        hpo_labels["HP:0000001"] = "phenotypic abnormality (unspecified)"
+
     return {
         "validated_hpo_codes": validated_codes,
-        "hpo_labels": labels_map,
-        "debate_turn_counter": 1
+        "hpo_labels": hpo_labels,
     }
