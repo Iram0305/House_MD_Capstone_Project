@@ -12,15 +12,13 @@ def generate_with_retry(client, model, contents, config=None):
         try:
             time.sleep(1)
             return client.models.generate_content(model=model, contents=contents, config=config)
-        except errors.ClientError as e:
-            if getattr(e, 'status_code', None) == 429 or "429" in str(e):
-                if attempt == max_retries - 1:
-                    raise e
-                print(f"⚠️ [Scribe Rate Limit]: Retrying transcript compression in {delay} seconds...")
-                time.sleep(delay)
-                delay *= 2
-            else:
+        except errors.APIError as e:
+            if attempt == max_retries - 1:
                 raise e
+            status_code = getattr(e, 'status_code', '5xx/Timeout')
+            print(f"⚠️ [Scribe API Error - Status {status_code}]: Retrying transcript compression in {delay} seconds...")
+            time.sleep(delay)
+            delay *= 2
 
 def run_scribe_node(state: MedicalBoardState) -> dict:
     client = genai.Client()
