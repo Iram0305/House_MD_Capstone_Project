@@ -6,28 +6,26 @@ from google.genai import errors
 from src.state import MedicalBoardState
 
 def generate_with_retry(client, model, contents, config=None):
-    """Safely handles Gemini API calls with automatic retry backoff for rate limits."""
+    """Safely handles Gemini API calls with automatic retry backoff for all API errors."""
     delay = 4  
     max_retries = 5
     for attempt in range(max_retries):
         try:
             time.sleep(1)
             return client.models.generate_content(model=model, contents=contents, config=config)
-        except errors.ClientError as e:
-            if getattr(e, 'status_code', None) == 429 or "429" in str(e):
-                if attempt == max_retries - 1:
-                    raise e
-                print(f"⚠️ [Boardroom Rate Limit]: Retrying agent activation in {delay} seconds...")
-                time.sleep(delay)
-                delay *= 2
-            else:
+        except errors.APIError as e:
+            if attempt == max_retries - 1:
                 raise e
+            status_code = getattr(e, 'status_code', '5xx/Timeout')
+            print(f"⚠️ [Boardroom API Error - Status {status_code}]: Retrying agent activation in {delay} seconds...")
+            time.sleep(delay)
+            delay *= 2
 
 def run_specialist_debate(state: MedicalBoardState, specialty_name: str, specialty_focus: str) -> dict:
     client = genai.Client()
     symptom_list = [f"{code} ({state['hpo_labels'][code]})" for code in state['validated_hpo_codes']]
     
-    system_instruction = f"You are a world-class Medical Specialist in {specialty_name}. Core Target Focus: {specialty_focus}."
+    system_instruction = f"You are a world-class Medical Specialist in {specialty_name}. Focus: {specialty_focus}. Be concise, clear, and omit unnecessary conversational pleasantries."
     
     user_prompt = f"""
     Review these patient symptoms: {symptom_list}
