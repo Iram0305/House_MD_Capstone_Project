@@ -53,7 +53,8 @@ def run_parser_node(state: MedicalBoardState) -> dict:
         with open("data/hp-base.json", "r") as f:
             hpo_data = json.load(f)
             
-        nodes = hpo_data.get("graphs", [{}])[0].get("nodes", []):
+        # FIXED: Removed the trailing colon from the line below
+        nodes = hpo_data.get("graphs", [{}])[0].get("nodes", [])
         
         for phrase in extracted_phrases:
             if not phrase: continue
