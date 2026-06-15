@@ -12,15 +12,13 @@ def generate_with_retry(client, model, contents, config=None):
         try:
             time.sleep(1)
             return client.models.generate_content(model=model, contents=contents, config=config)
-        except errors.ClientError as e:
-            if getattr(e, 'status_code', None) == 429 or "429" in str(e):
-                if attempt == max_retries - 1:
-                    raise e
-                print(f"⚠️ [CMO Rate Limit]: Retrying executive synthesis in {delay} seconds...")
-                time.sleep(delay)
-                delay *= 2
-            else:
+        except errors.APIError as e:
+            if attempt == max_retries - 1:
                 raise e
+            status_code = getattr(e, 'status_code', '5xx/Timeout')
+            print(f"⚠️ [CMO API Error - Status {status_code}]: Retrying executive synthesis in {delay} seconds...")
+            time.sleep(delay)
+            delay *= 2
 
 def run_cmo_node(state: MedicalBoardState) -> dict:
     print("\n--- PHASE 4: CMO SYNTHESIS REPORT ---")
@@ -29,10 +27,10 @@ def run_cmo_node(state: MedicalBoardState) -> dict:
     evidence = state.get("evidence_payload", {})
     verified_context = {d: p for d, p in evidence.items() if p["orphadata_match"] or p["pubmed_citations"]}
     
-    system_instruction = "Act as the Chief Medical Officer."
+    system_instruction = "Act as the Chief Medical Officer. Provide a rigorous, evidence-grounded final output document."
     
     user_prompt = f"""
-    Compile the final definitive clinical diagnostic support document.
+    Compile the final definitive clinical diagnostic support document based strictly on the verified data.
     Include only conditions backed by verified tokens.
     
     Verified Sources: {verified_context}
