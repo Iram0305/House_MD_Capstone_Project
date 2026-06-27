@@ -5,22 +5,16 @@ Single source of truth for:
   • The singleton genai.Client (one object for the entire process lifetime)
   • The inter-call pacing governor  (prevents burst 429s)
   • The generate_with_retry wrapper (handles transient errors & Retry-After)
-  • Automatic model fallback chain (primary → fallback → last-resort)
 
 Import from here in BOTH parser.py AND agents.py so the logic never drifts.
 
-Free-tier RPM reality check
-----------------------------
-gemini-2.0-flash  → 15 RPM  = 1 req / 4s  (1,500 req/day)
-gemini-1.5-flash  → 15 RPM  = 1 req / 4s  (1,500 req/day)
-gemini-1.5-flash-8b → 15 RPM (separate quota bucket — used as last-resort)
+Model selection note
+--------------------
+gemini-3.5-flash  →  FREE TIER LIMIT: only 20 requests/day  ← causes your crash
+gemini-2.0-flash  →  FREE TIER LIMIT: 1,500 requests/day   ← recommended
+gemini-1.5-flash  →  FREE TIER LIMIT: 1,500 requests/day   ← fallback alternative
 
-Your swarm fires 7–21 calls per run. The pacing governor enforces a hard
-floor of 6s between ALL calls (= max 10 RPM), keeping you safely below the
-15 RPM ceiling even during the cyclic debate loop.
-
-When a model's own quota bucket is exhausted, the fallback chain rotates to
-the next model automatically instead of burning all retries on a dead quota.
+Change ACTIVE_MODEL below to swap across the whole project instantly.
 """
 
 import json
@@ -31,16 +25,26 @@ from google import genai
 from google.genai import errors, types
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MODEL CONFIGURATION
-# Three separate free-tier quota buckets. When the primary is rate-limited,
-# generate_with_retry() falls through to the next one automatically.
+# MODEL CONFIGURATION  ← change this one constant to affect the entire project
 # ─────────────────────────────────────────────────────────────────────────────
-ACTIVE_MODEL = "gemini-2.0-flash"          # primary   — 1,500 req/day free
+# ─────────────────────────────────────────────────────────────────────────────
+# ⚠️  MODEL MIGRATION NOTE (June 2026)
+# gemini-2.0-flash was SHUT DOWN on June 1, 2026 — calling it returns 429/404.
+# gemini-1.5-flash (bare alias) does not exist in v1beta — returns 404.
+#
+# Current live free-tier models and their actual RPM limits:
+#   gemini-2.5-flash      →  10 RPM,  250 req/day  (best quality)
+#   gemini-2.5-flash-lite →  15 RPM, 1000 req/day  (highest throughput)
+#   gemini-2.5-pro        →   5 RPM,  100 req/day  (avoid for multi-agent)
+#
+# The fallback chain below uses three SEPARATE quota buckets so a rate-limited
+# primary automatically rotates to a fresh bucket instead of burning retries.
+# ─────────────────────────────────────────────────────────────────────────────
+ACTIVE_MODEL = "gemini-2.5-flash"          # primary
 
 MODEL_FALLBACK_CHAIN = [
-    "gemini-2.0-flash",                    # primary
-    "gemini-1.5-flash",                    # fallback  — separate quota bucket
-    "gemini-1.5-flash-8b",                 # last-resort — smallest, most lenient
+    "gemini-2.5-flash",                    # primary   — 10 RPM, 250 req/day
+    "gemini-2.5-flash-lite",               # fallback  — 15 RPM, 1000 req/day (separate quota)
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -61,10 +65,11 @@ _client = genai.Client()
 # ─────────────────────────────────────────────────────────────────────────────
 _last_call_ts: float = 0.0
 
-# 6s gap = max 10 RPM sustained, safely under the 15 RPM free-tier ceiling.
-# The 2.0-flash burst window is a rolling 60s bucket, so staying at 10 RPM
-# gives a 33% headroom buffer against any burst spike during the debate loop.
-MIN_INTER_CALL_GAP_SEC: float = 6.0
+# gemini-2.5-flash free tier = 10 RPM = 1 req every 6s ceiling.
+# We use 7s (≈8.5 RPM) to leave 15% headroom against burst windows.
+# gemini-2.5-flash-lite allows 15 RPM but we keep the same gap since the
+# pacing governor is shared across both models in the fallback chain.
+MIN_INTER_CALL_GAP_SEC: float = 7.0
 
 
 def _pace() -> None:
@@ -142,34 +147,25 @@ def generate_with_retry(
     config: types.GenerateContentConfig | None = None,
     model: str | None = None,
     max_retries: int = 3,
-    base_delay: float = 6.0,
+    base_delay: float = 7.0,
     max_delay: float = 60.0,
 ) -> types.GenerateContentResponse:
     """
-    Call the Gemini API with pacing, smart retries, and automatic model fallback.
+    Call the Gemini API with pacing, retries, and automatic model fallback.
 
-    Retry strategy (per model in the fallback chain):
-      • max_retries=3 attempts per model (down from 6 — stops wasting time on
-        a quota bucket that's clearly exhausted)
-      • base_delay=6.0s aligns with the pacing gap so the first retry fires
-        at the same cadence as normal calls — no extra waiting
-      • On persistent 429, rotates to the next model in MODEL_FALLBACK_CHAIN
-        instead of hammering the same exhausted quota bucket
+    Strategy:
+      - 3 retries per model (not 6 — stops wasting time on an exhausted bucket)
+      - base_delay matches pacing gap so first retry is no slower than a normal call
+      - On persistent 429, rotates to the next model in MODEL_FALLBACK_CHAIN,
+        which has its own independent quota bucket
 
     Parameters
     ----------
     contents  : The user prompt string.
     config    : Optional GenerateContentConfig (system instruction, temperature…).
     model     : Pin to a specific model, bypassing the fallback chain.
-    max_retries, base_delay, max_delay : Retry tuning knobs.
-
-    Raises
-    ------
-    errors.APIError  after all models in the chain are exhausted.
     """
-    # If caller pins a model, use only that model (no chain)
     chain = [model] if model else MODEL_FALLBACK_CHAIN
-
     last_exc = None
 
     for current_model in chain:
@@ -185,8 +181,8 @@ def generate_with_retry(
                 _mark_call()
                 if current_model != ACTIVE_MODEL:
                     logging.info(
-                        f"[API Fallback] Successfully used '{current_model}' "
-                        f"(primary '{ACTIVE_MODEL}' was rate-limited)."
+                        f"[API Fallback] Used '{current_model}' "
+                        f"(primary '{ACTIVE_MODEL}' exhausted)."
                     )
                 return response
 
@@ -194,15 +190,15 @@ def generate_with_retry(
                 last_exc = exc
                 status_code = _get_status_code(exc)
 
-                # Non-retryable hard error — don't try other models either
+                # Hard errors (400, 401, 403, 404) — don't retry, don't fallback
                 if not _is_retryable(status_code):
                     logging.error(
                         f"[API Fatal {status_code}] Non-retryable on "
-                        f"'{current_model}'. Detail: {exc}"
+                        f"'{current_model}': {exc}"
                     )
                     raise
 
-                # All retries for this model exhausted → try next model
+                # All retries for this model exhausted → rotate to next model
                 if attempt == max_retries - 1:
                     logging.warning(
                         f"[API] {max_retries} retries exhausted on "
@@ -215,7 +211,7 @@ def generate_with_retry(
 
                 logging.warning(
                     f"[API Error {status_code}] Attempt {attempt + 1}/{max_retries} "
-                    f"on model '{current_model}'. "
+                    f"on '{current_model}'. "
                     f"{'Retry-After hint' if retry_after else 'Backoff'}. "
                     f"Sleeping {sleep_for:.1f}s…"
                 )
@@ -223,9 +219,7 @@ def generate_with_retry(
                 delay = min(delay * 2, max_delay)
                 _mark_call()
 
-    # Every model in the chain failed
     logging.error(
-        "[API] All models in fallback chain exhausted. "
-        f"Chain tried: {chain}. Last error: {last_exc}"
+        f"[API] All models exhausted. Chain: {chain}. Last error: {last_exc}"
     )
     raise last_exc
