@@ -1,13 +1,4 @@
-"""
-app.py  —  House M.D. Swarm: Streamlit front-end (fully autonomous edition)
-============================================================================
-
-Single-click run: one button triggers the entire graph to completion.
-The UI updates live after each node finishes (via st.empty placeholders),
-so you can watch the debate unfold without clicking anything.
-Partial output is preserved in session_state if an error occurs mid-run.
-"""
-
+import time
 import streamlit as st
 from pypdf import PdfReader
 from langgraph.graph import StateGraph, END
@@ -27,6 +18,7 @@ st.set_page_config(page_title="House M.D. Swarm", layout="wide")
 st.title("🩺 The 'House M.D.' Swarm: Rare Disease Explorer")
 st.caption("Autonomous Multi-Agent Deliberation Panel for Complex Clinical Diagnostics")
 
+MAX_AUTO_RETRIES = 3   # silent 503 resumes before surfacing an error
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GRAPH FACTORY
@@ -65,23 +57,44 @@ for _k, _v in {
     "run_complete": False,
     "run_started": False,
     "error": None,
+    "auto_retry_count": 0,
 }.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NODE LABEL MAP  (for live progress display only — no gating)
+# NODE LABEL MAP
 # ─────────────────────────────────────────────────────────────────────────────
 NODE_LABELS = {
-    "parser":    "🔬 Extracting HPO codes from case narrative…",
+    "parser":        "🔬 Extracting HPO codes from case narrative…",
     "neurologist":   "🧠 Neurologist deliberating…",
     "immunologist":  "🛡️ Immunologist deliberating…",
     "geneticist":    "🧬 Geneticist deliberating…",
-    "scribe":    "📝 Scribe compressing transcript…",
-    "research":  "🔭 Research node querying evidence base…",
-    "cmo":       "📋 Chief Medical Officer synthesising final report…",
+    "scribe":        "📝 Scribe compressing transcript…",
+    "research":      "🔭 Research node querying evidence base…",
+    "cmo":           "📋 Chief Medical Officer synthesising final report…",
 }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 503 DETECTION
+# ─────────────────────────────────────────────────────────────────────────────
+def _is_503(exc: Exception) -> bool:
+    """True if the exception is a transient server overload (503/UNAVAILABLE)."""
+    msg = str(exc).upper()
+    return (
+        "503" in msg
+        or "UNAVAILABLE" in msg
+        or "HIGH DEMAND" in msg
+        or "SERVICE UNAVAILABLE" in msg
+    )
+
+
+def _is_transient(exc: Exception) -> bool:
+    """True for any error worth auto-retrying at the app level."""
+    msg = str(exc).upper()
+    return _is_503(exc) or "502" in msg or "504" in msg or "TIMEOUT" in msg
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -103,7 +116,6 @@ def render_debate_log(full_log: list):
 def render_state(state: dict):
     if not state:
         return
-
     left_col, right_col = st.columns(2)
 
     with left_col:
@@ -152,8 +164,8 @@ if uploaded_file is not None:
     extracted_text = "".join(p.extract_text() + "\n" for p in pdf_reader.pages)
     st.success("Case file extracted.")
 
-    if st.button("🚀 Run Full Diagnostic Board", type="primary", disabled=st.session_state.run_started):
-        # Reset everything for a fresh run
+    if st.button("🚀 Run Full Diagnostic Board", type="primary",
+                 disabled=st.session_state.run_started):
         st.session_state.live_state = {
             "raw_narrative": extracted_text,
             "validated_hpo_codes": [],
@@ -170,20 +182,23 @@ if uploaded_file is not None:
         st.session_state.run_complete = False
         st.session_state.run_started = True
         st.session_state.error = None
+        st.session_state.auto_retry_count = 0
         st.session_state.graph = build_workflow_graph()
         st.rerun()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AUTONOMOUS RUN LOOP — executes only when run_started=True, run_complete=False
-# Drains the entire LangGraph stream in one pass, updating placeholders live.
+# AUTONOMOUS RUN LOOP
+# Resumes from live_state on transient errors (503 etc.) up to MAX_AUTO_RETRIES.
 # ─────────────────────────────────────────────────────────────────────────────
 if st.session_state.run_started and not st.session_state.run_complete and not st.session_state.error:
 
-    status_box = st.empty()        # live "currently running node" indicator
-    output_area = st.empty()       # live partial output, replaced after each node
+    status_box = st.empty()
+    output_area = st.empty()
 
     try:
+        # Always stream from the current live_state so a resumed run
+        # picks up exactly where the last successful node left off.
         stream = st.session_state.graph.stream(
             st.session_state.live_state,
             stream_mode="updates",
@@ -191,38 +206,55 @@ if st.session_state.run_started and not st.session_state.run_complete and not st
 
         for event in stream:
             node_name, delta = next(iter(event.items()))
-
-            # Merge delta into accumulated state
             st.session_state.live_state.update(delta)
 
-            # Show which node just finished
             label = NODE_LABELS.get(node_name, f"⚙️ {node_name} running…")
             status_box.info(label)
 
-            # Re-render the full accumulated output after every node
             with output_area.container():
                 render_state(st.session_state.live_state)
 
-        # Stream exhausted — run is complete
+        # Stream drained cleanly
         st.session_state.run_complete = True
         st.session_state.run_started = False
+        st.session_state.auto_retry_count = 0
         status_box.empty()
         st.rerun()
 
     except Exception as exc:
-        st.session_state.error = str(exc)
-        st.session_state.run_started = False
-        status_box.empty()
-        st.rerun()
+        retries_used = st.session_state.auto_retry_count
+
+        if _is_transient(exc) and retries_used < MAX_AUTO_RETRIES:
+            # ── Silent auto-resume ────────────────────────────────────────────
+            st.session_state.auto_retry_count += 1
+            status_box.warning(
+                f"⏳ Gemini servers are busy (503). "
+                f"Auto-resuming in 20s… "
+                f"(attempt {st.session_state.auto_retry_count}/{MAX_AUTO_RETRIES})"
+            )
+            # Partial output stays visible via output_area during the wait
+            with output_area.container():
+                render_state(st.session_state.live_state)
+            time.sleep(20)
+            # run_started stays True so the block re-executes on rerun
+            st.rerun()
+
+        else:
+            # ── Give up — surface the error, preserve partial output ──────────
+            st.session_state.error = str(exc)
+            st.session_state.run_started = False
+            status_box.empty()
+            st.rerun()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STATIC RENDER — shown after completion or on page re-load
+# STATIC RENDER
 # ─────────────────────────────────────────────────────────────────────────────
 if st.session_state.error:
     st.error(
         f"⚠️ Error mid-run: `{st.session_state.error}`\n\n"
-        "All output computed before the error is preserved below."
+        "All output computed before the error is preserved below. "
+        "Click **Run Another Case** to retry from scratch."
     )
 
 if st.session_state.live_state and (st.session_state.run_complete or st.session_state.error):
@@ -233,8 +265,8 @@ if st.session_state.run_complete:
     st.balloons()
     st.success("✅ Diagnostic board complete.")
 
-    # Reset button for a new case
     if st.button("🔄 Run Another Case"):
-        for k in ["live_state", "run_complete", "run_started", "error", "graph"]:
-            st.session_state[k] = None if k in ("live_state", "error", "graph") else False
+        for k in ["live_state", "run_complete", "run_started", "error", "graph", "auto_retry_count"]:
+            st.session_state[k] = None if k in ("live_state", "error", "graph") else False if k != "auto_retry_count" else 0
         st.rerun()
+
