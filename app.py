@@ -1,17 +1,11 @@
 """
-app.py  —  House M.D. Swarm: Streamlit front-end (HITL streaming edition)
-==========================================================================
+app.py  —  House M.D. Swarm: Streamlit front-end (fully autonomous edition)
+============================================================================
 
-Architecture changes vs. original:
-  1. app_graph.stream() replaces app_graph.invoke() — every node's state
-     delta is written into st.session_state as it arrives, so a mid-run
-     crash never hides already-computed output.
-  2. HITL stage gates: after each significant node the stream loop
-     writes a `pending_approval` key and immediately re-runs Streamlit.
-     The UI renders the completed output and a "Proceed" button.  Nothing
-     token-consuming fires again until the user clicks.
-  3. The graph is compiled once and stored in session_state so it survives
-     the Streamlit re-run cycle triggered by button clicks.
+Single-click run: one button triggers the entire graph to completion.
+The UI updates live after each node finishes (via st.empty placeholders),
+so you can watch the debate unfold without clicking anything.
+Partial output is preserved in session_state if an error occurs mid-run.
 """
 
 import streamlit as st
@@ -31,17 +25,14 @@ from src.router import evaluate_convergence_edge
 # ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="House M.D. Swarm", layout="wide")
 st.title("🩺 The 'House M.D.' Swarm: Rare Disease Explorer")
-st.caption(
-    "An Autonomous Stateful Multi-Agent Deliberation Panel for Complex Clinical Diagnostics"
-)
+st.caption("Autonomous Multi-Agent Deliberation Panel for Complex Clinical Diagnostics")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GRAPH FACTORY  (compiled once, stored in session_state)
+# GRAPH FACTORY
 # ─────────────────────────────────────────────────────────────────────────────
 def build_workflow_graph():
     workflow = StateGraph(MedicalBoardState)
-
     workflow.add_node("parser", run_parser_node)
     workflow.add_node("neurologist", neurologist_node)
     workflow.add_node("immunologist", immunologist_node)
@@ -55,92 +46,73 @@ def build_workflow_graph():
     workflow.add_edge("neurologist", "immunologist")
     workflow.add_edge("immunologist", "geneticist")
     workflow.add_edge("geneticist", "scribe")
-
     workflow.add_conditional_edges(
         "scribe",
         evaluate_convergence_edge,
         {"continue": "neurologist", "research": "research"},
     )
-
     workflow.add_edge("research", "cmo")
     workflow.add_edge("cmo", END)
-
     return workflow.compile()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SESSION STATE INITIALISATION
+# SESSION STATE
 # ─────────────────────────────────────────────────────────────────────────────
-def _init_session():
-    defaults = {
-        "graph": None,
-        "live_state": None,          # MedicalBoardState built up incrementally
-        "stream_iter": None,         # Active LangGraph stream iterator
-        "pending_approval": None,    # Stage name waiting for user click
-        "run_complete": False,
-        "error": None,
-    }
-    for key, val in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = val
-
-_init_session()
+for _k, _v in {
+    "graph": None,
+    "live_state": None,
+    "run_complete": False,
+    "run_started": False,
+    "error": None,
+}.items():
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HITL GATE DEFINITIONS
-# Maps node names → display labels shown above the "Proceed" button.
+# NODE LABEL MAP  (for live progress display only — no gating)
 # ─────────────────────────────────────────────────────────────────────────────
-HITL_GATES = {
-    "parser":            "🔬 Parser complete — HPO codes extracted",
-    "Neurology":         "🧠 Neurologist has submitted their analysis",
-    "Clinical Immunology": "🛡️ Immunologist has submitted their analysis",
-    "Medical Genetics":  "🧬 Geneticist has submitted their analysis",
-    "scribe":            "📝 Scribe has compressed the board transcript",
-    "research":          "🔭 Research node complete — evidence retrieved",
+NODE_LABELS = {
+    "parser":    "🔬 Extracting HPO codes from case narrative…",
+    "neurologist":   "🧠 Neurologist deliberating…",
+    "immunologist":  "🛡️ Immunologist deliberating…",
+    "geneticist":    "🧬 Geneticist deliberating…",
+    "scribe":    "📝 Scribe compressing transcript…",
+    "research":  "🔭 Research node querying evidence base…",
+    "cmo":       "📋 Chief Medical Officer synthesising final report…",
 }
 
-# Nodes that should pause for human approval before proceeding
-PAUSE_AFTER = set(HITL_GATES.keys())
-
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RENDERING HELPERS
+# RENDERING
 # ─────────────────────────────────────────────────────────────────────────────
 def render_debate_log(full_log: list):
-    """Render the debate transcript with per-specialist chat bubbles."""
     for line in full_log:
         if "[Neurology Doctor]" in line:
-            text = line.replace("[Neurology Doctor]: ", "")
             with st.chat_message("assistant", avatar="🧠"):
-                st.markdown(f"**Neurologist:** {text}")
+                st.markdown("**Neurologist:** " + line.replace("[Neurology Doctor]: ", ""))
         elif "[Clinical Immunology Doctor]" in line:
-            text = line.replace("[Clinical Immunology Doctor]: ", "")
             with st.chat_message("assistant", avatar="🛡️"):
-                st.markdown(f"**Immunologist:** {text}")
+                st.markdown("**Immunologist:** " + line.replace("[Clinical Immunology Doctor]: ", ""))
         elif "[Medical Genetics Doctor]" in line:
-            text = line.replace("[Medical Genetics Doctor]: ", "")
             with st.chat_message("assistant", avatar="🧬"):
-                st.markdown(f"**Geneticist:** {text}")
+                st.markdown("**Geneticist:** " + line.replace("[Medical Genetics Doctor]: ", ""))
 
 
-def render_partial_state(state: dict):
-    """
-    Render whatever has been computed so far.
-    Called both during the stream loop and on every re-run.
-    """
+def render_state(state: dict):
     if not state:
         return
 
     left_col, right_col = st.columns(2)
 
     with left_col:
-        st.subheader("💬 Live Boardroom Transcript")
+        st.subheader("💬 Boardroom Transcript")
         log = state.get("full_debate_log", [])
         if log:
             render_debate_log(log)
         else:
-            st.info("Waiting for specialists to speak...")
+            st.info("Waiting for specialists…")
 
         hpo = state.get("validated_hpo_codes", [])
         if hpo:
@@ -153,85 +125,36 @@ def render_partial_state(state: dict):
     with right_col:
         guesses = state.get("current_guesses", [])
         if guesses:
-            st.subheader("🎯 Current Disease Candidates")
+            st.subheader("🎯 Disease Candidates (evolving)")
             for entry in guesses:
                 st.markdown(f"**{entry['specialty']}:** {', '.join(entry['candidates'])}")
 
         report = state.get("final_report", {})
         if report:
             st.markdown("---")
-            st.subheader("📋 Chief Medical Officer Synthesis")
-            st.write(report.get("free_text_report", "No report text synthesized."))
+            st.subheader("📋 Chief Medical Officer — Final Diagnosis")
+            st.success(report.get("free_text_report", "No report synthesised."))
 
         transcript = state.get("compressed_transcript", "")
         if transcript and transcript != "No notes yet. Debate has initialized.":
             st.markdown("---")
-            with st.expander("📝 Compressed Board Notes (Scribe)"):
+            with st.expander("📝 Compressed Board Notes"):
                 st.markdown(transcript)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STREAMING ENGINE
+# FILE UPLOAD
 # ─────────────────────────────────────────────────────────────────────────────
-def advance_stream():
-    """
-    Pull the next event from the LangGraph stream iterator.
-    Merges the state delta into session_state.live_state.
-    If the completed node is in PAUSE_AFTER, sets pending_approval and stops.
-    Catches all exceptions so partial output is never lost.
-    """
-    iterator = st.session_state.stream_iter
-    if iterator is None:
-        return
-
-    try:
-        event = next(iterator)                      # {node_name: state_delta}
-    except StopIteration:
-        st.session_state.run_complete = True
-        st.session_state.stream_iter = None
-        return
-    except Exception as exc:
-        st.session_state.error = str(exc)
-        st.session_state.stream_iter = None
-        return
-
-    # Merge the delta into our accumulated live_state
-    node_name, delta = next(iter(event.items()))
-    if st.session_state.live_state is None:
-        st.session_state.live_state = {}
-    st.session_state.live_state.update(delta)
-
-    # Determine the stage label for HITL gating:
-    # agents write hitl_stage = specialty_name; other nodes use node_name.
-    stage_key = delta.get("hitl_stage") or node_name
-
-    if stage_key in PAUSE_AFTER:
-        st.session_state.pending_approval = stage_key
-    else:
-        # Non-gated node: keep streaming automatically
-        advance_stream()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# FILE UPLOAD & RUN TRIGGER
-# ─────────────────────────────────────────────────────────────────────────────
-uploaded_file = st.file_uploader(
-    "Upload Patient Case Report (PDF Format)", type=["pdf"]
-)
+uploaded_file = st.file_uploader("Upload Patient Case Report (PDF)", type=["pdf"])
 
 if uploaded_file is not None:
     pdf_reader = PdfReader(uploaded_file)
-    extracted_text = "".join(
-        page.extract_text() + "\n" for page in pdf_reader.pages
-    )
-    st.success("Case file text extracted successfully!")
+    extracted_text = "".join(p.extract_text() + "\n" for p in pdf_reader.pages)
+    st.success("Case file extracted.")
 
-    if (
-        st.button("Trigger Autonomous Diagnostics Board")
-        and st.session_state.stream_iter is None
-        and not st.session_state.run_complete
-    ):
-        initial_state: MedicalBoardState = {
+    if st.button("🚀 Run Full Diagnostic Board", type="primary", disabled=st.session_state.run_started):
+        # Reset everything for a fresh run
+        st.session_state.live_state = {
             "raw_narrative": extracted_text,
             "validated_hpo_codes": [],
             "hpo_labels": {},
@@ -244,62 +167,74 @@ if uploaded_file is not None:
             "debate_turn_counter": 0,
             "hitl_stage": None,
         }
-
-        if st.session_state.graph is None:
-            st.session_state.graph = build_workflow_graph()
-
-        # Open the stream — nothing executes yet; first advance_stream() call
-        # will pull the first event.
-        st.session_state.stream_iter = st.session_state.graph.stream(
-            initial_state, stream_mode="updates"
-        )
-        st.session_state.live_state = dict(initial_state)
         st.session_state.run_complete = False
+        st.session_state.run_started = True
         st.session_state.error = None
-        st.session_state.pending_approval = None
-
-        # Kick off streaming until the first HITL gate
-        advance_stream()
+        st.session_state.graph = build_workflow_graph()
         st.rerun()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MAIN UI — renders on every Streamlit re-run
+# AUTONOMOUS RUN LOOP — executes only when run_started=True, run_complete=False
+# Drains the entire LangGraph stream in one pass, updating placeholders live.
 # ─────────────────────────────────────────────────────────────────────────────
-state = st.session_state.live_state
+if st.session_state.run_started and not st.session_state.run_complete and not st.session_state.error:
 
-# ── Error banner (partial output already shown below) ─────────────────────
+    status_box = st.empty()        # live "currently running node" indicator
+    output_area = st.empty()       # live partial output, replaced after each node
+
+    try:
+        stream = st.session_state.graph.stream(
+            st.session_state.live_state,
+            stream_mode="updates",
+        )
+
+        for event in stream:
+            node_name, delta = next(iter(event.items()))
+
+            # Merge delta into accumulated state
+            st.session_state.live_state.update(delta)
+
+            # Show which node just finished
+            label = NODE_LABELS.get(node_name, f"⚙️ {node_name} running…")
+            status_box.info(label)
+
+            # Re-render the full accumulated output after every node
+            with output_area.container():
+                render_state(st.session_state.live_state)
+
+        # Stream exhausted — run is complete
+        st.session_state.run_complete = True
+        st.session_state.run_started = False
+        status_box.empty()
+        st.rerun()
+
+    except Exception as exc:
+        st.session_state.error = str(exc)
+        st.session_state.run_started = False
+        status_box.empty()
+        st.rerun()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STATIC RENDER — shown after completion or on page re-load
+# ─────────────────────────────────────────────────────────────────────────────
 if st.session_state.error:
     st.error(
-        f"⚠️ An error occurred: `{st.session_state.error}`\n\n"
-        "All outputs computed before the error are preserved below."
+        f"⚠️ Error mid-run: `{st.session_state.error}`\n\n"
+        "All output computed before the error is preserved below."
     )
 
-# ── Partial / final output ─────────────────────────────────────────────────
-if state:
+if st.session_state.live_state and (st.session_state.run_complete or st.session_state.error):
     st.markdown("---")
-    render_partial_state(state)
+    render_state(st.session_state.live_state)
 
-# ── HITL approval gate ─────────────────────────────────────────────────────
-pending = st.session_state.pending_approval
-
-if pending and not st.session_state.run_complete and not st.session_state.error:
-    st.markdown("---")
-    gate_label = HITL_GATES.get(pending, f"Stage '{pending}' complete")
-    st.info(f"**{gate_label}**\n\nReview the output above, then proceed when ready.")
-
-    if st.button("▶ Proceed to Next Phase", type="primary"):
-        st.session_state.pending_approval = None
-        advance_stream()           # Pull next event(s) until the next gate
-        st.rerun()
-
-# ── Completion banner ──────────────────────────────────────────────────────
 if st.session_state.run_complete:
     st.balloons()
-    st.success("✅ Diagnostic board session complete. See the CMO report above.")
+    st.success("✅ Diagnostic board complete.")
 
-# ── Active streaming indicator (no gate pending, stream still open) ────────
-elif st.session_state.stream_iter is not None and pending is None:
-    with st.spinner("Medical board is deliberating..."):
-        advance_stream()
+    # Reset button for a new case
+    if st.button("🔄 Run Another Case"):
+        for k in ["live_state", "run_complete", "run_started", "error", "graph"]:
+            st.session_state[k] = None if k in ("live_state", "error", "graph") else False
         st.rerun()
